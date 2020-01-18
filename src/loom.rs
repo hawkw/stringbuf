@@ -3,6 +3,7 @@ pub(crate) use self::inner::*;
 #[cfg(test)]
 mod inner {
     pub(crate) use loom::sync::CausalCell;
+    pub(crate) use loom::sync::Mutex;
     pub(crate) use loom::sync::{Arc, Weak};
     pub(crate) mod atomic {
         pub use loom::sync::atomic::*;
@@ -14,6 +15,7 @@ mod inner {
 mod inner {
     use std::cell::UnsafeCell;
     pub(crate) use std::sync::atomic;
+    pub(crate) use std::sync::Mutex;
     pub(crate) use std::sync::{Arc, Weak};
 
     #[derive(Debug)]
