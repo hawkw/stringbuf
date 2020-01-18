@@ -1,9 +1,13 @@
 pub(crate) mod loom;
 
 use crate::loom::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, CausalCell, Mutex, Weak,
+    atomic::{self, AtomicUsize, Ordering},
+    CausalCell, Mutex,
 };
+use std::sync::{Arc, Weak};
+
+#[cfg(test)]
+mod tests;
 
 pub fn with_capacity(capacity: usize) -> (Writer, Reader) {
     let mut buf = Vec::with_capacity(capacity);
@@ -17,7 +21,7 @@ pub fn with_capacity(capacity: usize) -> (Writer, Reader) {
     });
 
     let reader = Reader {
-        inner: Arc::downgrade(&inner),
+        inner: inner.clone(),
         next: 0,
     };
     let writer = Writer { inner };
@@ -31,7 +35,7 @@ pub struct Writer {
 }
 
 pub struct Reader {
-    inner: Weak<Inner>,
+    inner: Arc<Inner>,
     next: usize,
 }
 
@@ -48,7 +52,7 @@ impl Writer {
         // XXX(eliza): there is maybe a bug here if writes on other threads
         // "lap" us while we are still writing...tbqh, we could protect against
         // this w/ a mutex...
-        let w = this.w_i.fetch_add(1, Ordering::AcqRel);
+        let w = this.w_i.fetch_add(1, Ordering::Release);
         let idx = w % this.len;
         // we now exclusively own `idx` (unless someone laps us)...
         #[cfg(debug_assertions)]
@@ -71,12 +75,16 @@ pub struct Closed {
 
 impl Reader {
     /// Returns `None`
-    pub fn read<T>(&mut self, f: impl FnOnce(&String) -> T) -> Result<Option<T>, Closed> {
-        let this = self.inner.upgrade().ok_or(Closed { _p: () })?;
+    pub fn try_read<T>(&mut self, f: impl FnOnce(&String) -> T) -> Result<Option<T>, Closed> {
+        let this = &*self.inner;
         let read_ix = this.r_i.load(Ordering::Acquire);
         if self.next >= read_ix {
-            // gotta slow down!
-            return Ok(None);
+            if Arc::strong_count(&self.inner) <= 1 {
+                return Err(Closed { _p: () });
+            } else {
+                // gotta slow down!
+                return Ok(None);
+            }
         }
         let idx = self.next % this.len;
 
@@ -90,5 +98,32 @@ impl Reader {
 
         self.next += 1;
         Ok(Some(res))
+    }
+
+    pub fn read<T>(&mut self, f: impl FnOnce(&String) -> T) -> Result<T, Closed> {
+        let this = &*self.inner;
+        let mut read_ix;
+        loop {
+            read_ix = this.r_i.load(Ordering::Acquire);
+            if self.next < read_ix {
+                break;
+            } else if Arc::strong_count(&self.inner) <= 1 {
+                return Err(Closed { _p: () });
+            }
+            atomic::spin_loop_hint();
+        }
+
+        let idx = self.next % this.len;
+
+        #[cfg(debug_assertions)]
+        let lock = this.buf[idx]
+            .try_lock()
+            .expect("unless poisoned, this should always succeed???");
+        #[cfg(not(debug_assertions))]
+        let lock = this.buf[idx].lock().unwrap();
+        let res = f(&*lock);
+
+        self.next += 1;
+        Ok(res)
     }
 }
